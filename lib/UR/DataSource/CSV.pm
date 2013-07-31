@@ -230,14 +230,14 @@ my($self,$fk_catalog,$fk_schema,$fk_table,$pk_catalog,$pk_schema,$pk_table) = @_
 }
 
 
-# DBD::CSV dosen't support bitmap indicies, so there aren't any
 sub get_bitmap_index_details_from_data_dictionary {
+    # DBD::CSV dosen't support bitmap indicies, so there aren't any
     return [];
 }
 
 
-# DBD::CSV doesn't support unique constraints
 sub get_unique_index_details_from_data_dictionary {
+    # DBD::CSV doesn't support unique constraints
     return {};
 }
 
