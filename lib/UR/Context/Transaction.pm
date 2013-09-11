@@ -6,6 +6,8 @@ use warnings;
 require UR;
 our $VERSION = "0.41"; # UR $VERSION;
 
+use Carp qw(croak confess shortmess);
+
 UR::Object::Type->define(
     class_name => __PACKAGE__,
     is => ['UR::Context'],
@@ -24,15 +26,12 @@ our $last_transaction_id = 0;
 
 sub delete {
     my $self = shift;
-    #$DB::single = 1;
     $self->rollback;
 }
 
-sub begin 
-{
+sub begin {
     my $class = shift;
     my $id = $last_transaction_id++;
-    #my $id = @open_transaction_stack;
 
     my $begin_point = @change_log;
     $log_all_changes = 1;
@@ -62,8 +61,7 @@ sub begin
     return $self;
 }
 
-sub log_change
-{
+sub log_change {
     my $this_class = shift;
     my ($object, $class, $id, $aspect, $undo_data) = @_;
 
@@ -109,8 +107,7 @@ sub has_changes {
     return (@changes > 1 ? 1 : ());
 }
 
-sub get_changes
-{
+sub get_changes {
     my $self = shift;
     my $begin_point = $self->begin_point;
     my $end_point = $self->end_point || $#change_log;
@@ -123,8 +120,7 @@ sub get_changes
     }
 }
 
-sub get_change_summary
-{
+sub get_change_summary {
     # TODO: This should compress multiple changes to the same object as much as possible
     # Right now, it just omits the creation event for the transaction object itself.
     # -> should the creation of the transaction be part of it?
@@ -140,8 +136,7 @@ sub get_change_summary
     return @changes;
 }
 
-sub rollback
-{
+sub rollback {
     my $self = shift;
 
     # Support calling as a class method: UR::Context::Transaction->rollback rolls back the current trans
@@ -230,8 +225,7 @@ sub rollback
     return 1;
 }
 
-sub commit
-{
+sub commit {
     my $self = shift;
 
     # Support calling as a class method: UR::Context::Transaction->commit commits the current transaction.
@@ -293,33 +287,57 @@ sub changes_can_be_saved {
     return 1;
 }
 
-sub execute
-{
-    my $class = shift;
-    Carp::confess("Attempt to call class method on instance.  This is probably not what you want...") if ref $class;
-    my $code = shift;
-    my $transaction = $class->begin;
-    my $result = eval($code->());
-    unless ($result) {
-        $transaction->rollback;
+sub eval_or_do {
+    my $is_failure = shift;
+    my $block = shift;
+
+    my $class = __PACKAGE__;
+    if (@_) {
+        confess('%s::eval takes one argument', $class);
     }
-    if ($@) { 
-        die $@;
+    my $tx = $class->begin();
+    my $result = CORE::eval { $block->() };
+    my $eval_error = $@;
+
+    if ($is_failure->($result, $eval_error)) {
+        $class->debug_message(shortmess('Rolling back transaction'));
+        $class->debug_message($eval_error) if ($eval_error);
+        unless($tx->rollback()) {
+            die 'failed to rollback transaction';
+        }
+    } else {
+        unless($tx->commit()) {
+            die 'failed to commit transaction';
+        }
     }
-    $transaction->commit;
-    return $result;
+
+    if (wantarray) {
+        return ($result, $eval_error);
+    } else {
+        return $result;
+    }
 }
 
-sub execute_and_rollback
-{
-    my $class = shift;
-    Carp::confess("Attempt to call class method on instance.  This is probably not what you want...") if ref $class;
-    my $code = shift;
-    my $transaction = $class->begin;
-    my $result = eval($code->());
-    $transaction->rollback;
-    if ($@) {
-        die $@;
+# eval function takes a block (&) sort of like CORE::eval
+# eval will rollback on a caught die
+sub eval(&) {
+    my $is_failure = sub {
+        my ($result, $eval_error) = @_;
+        return $eval_error;
+    };
+    return eval_or_do($is_failure, @_);
+}
+
+# do function takes a block (&) sort of like CORE::do
+# do will rollback on a false result as well as before re-throwing a caught die
+sub do(&) {
+    my $is_failure = sub {
+        my ($result, $eval_error) = @_;
+        return !$result || $eval_error;
+    };
+    my ($result, $eval_error) = eval_or_do($is_failure, @_);
+    if ($eval_error) {
+        croak $eval_error, "\t...propogated";
     }
     return $result;
 }
@@ -424,28 +442,25 @@ Return a list or L<UR::Change> objects representing changes within the transacti
 
 =over 4
 
-=item execute
+=item eval
 
-  $retval = UR::Context::Transaction->execute($coderef);
+  UR::Context::Transaction::eval BLOCK
 
-Executes the coderef with no arguments, within an eval and a software
-transaction.  If the coderef returns true, the transaction is committed.
-If it returns false, the transaction is rolled back.  Finally the coderef's
-return value is returned to the caller.
+Executes the BLOCK (with no arguments) wrapped by a software transaction and a
+CORE::eval.  If the BLOCK dies then the exception is caught and the software
+transaction is rolled back.
 
-If the coderef throws an exception, it will be caught, the transaction rolled
-back, and the exception will be re-thrown with die().
+=item do
 
-=item execute_and_rollback
+  UR::Context::Transaction::do BLOCK
 
-  UR::Context::Transaction->execute_and_rollback($coderef);
+Executes the BLOCK (with no arguments) wrapped by a software transaction and a
+CORE::eval.  If the BLOCK returns a true value and does not die then the
+software transaction is committed.  If the BLOCK returns false or dies then the
+software transaction is rolled back.
 
-Executes the coderef with no arguments, within an eval and a software
-transaction.  Reguardless of the return value of the coderef, the transaction
-will be rolled back.
-
-If the coderef throws an exception, it will be caught, the transaction rolled
-back, and the exception will be re-thrown with die().
+If the BLOCK throws an exception, it will be caught, the software transaction
+rolled back, and the exception will be re-thrown with die().
 
 =back
 

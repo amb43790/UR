@@ -36,7 +36,7 @@ UR::Object::Type->define(
         _all_dbh_hashref                 => { is => 'HASH', len => undef, is_transient => 1 },
         _last_savepoint                  => { is => 'Text', len => undef, is_transient => 1 },
     ],
-    valid_signals => ['query'],
+    valid_signals => ['query', 'query_failed', 'commit_failed', 'do_failed', 'connect_failed', 'sequence_nextval', 'sequence_nextval_failed'],
     doc => 'A logical DBI-based database, independent of prod/dev/testing considerations or login details.',
 );
 
@@ -450,14 +450,17 @@ sub _dbi_connect_args {
 
 sub get_connection_debug_info {
     my $self = shift;
+    my $handle_class = $self->default_handle_class;
     my @debug_info = (
         "DBI Data Source Name: ", $self->dbi_data_source_name, "\n",
         "DBI Login: ", $self->login, "\n",
         "DBI Version: ", $DBI::VERSION, "\n",
-        "DBI Error: ", UR::DBI->errstr, "\n",
+        "DBI Error: ", $handle_class->errstr, "\n",
     );
     return @debug_info;
 }
+
+sub default_handle_class { 'UR::DBI' };
 
 sub create_dbh { shift->create_default_handle_wrapper }
 sub create_default_handle {
@@ -470,12 +473,18 @@ sub create_default_handle {
     my @connection = $self->_dbi_connect_args();
     
     # connect
-    my $dbh = UR::DBI->connect(@connection);
+    my $handle_class = $self->default_handle_class;
+    my $dbh = $handle_class->connect(@connection);
     unless ($dbh) {
+        my $errstr;
+        {   no strict 'refs';
+            $errstr = ${"${handle_class}::errstr"};
+        };
         my @confession = (
-            "Failed to connect to the database!\n",
+            "Failed to connect to the database: $errstr\n",
             $self->get_connection_debug_info(),
         );
+        $self->__signal_observers__('connect_failed', 'connect', \@connection, $errstr);
         Carp::confess(@confession);
     }
 
@@ -1337,6 +1346,79 @@ sub get_unique_index_details_from_data_dictionary {
     Carp::confess("Class $class didn't define its own unique_index_info() method");
 }
 
+
+sub _resolve_table_name_for_class_name {
+    my($self, $class_name) = @_;
+
+    for my $parent_class_name ($class_name, $class_name->inheritance) {
+        my $parent_class = $parent_class_name->__meta__; # UR::Object::Type->get(class_name => $parent_class_name);
+        next unless $parent_class;
+        if (my $table_name = $parent_class->table_name) {
+            return $table_name;
+        }
+    }
+    return;
+}
+
+# For when there's no metaDB info for a class' table, it walks up the
+# ancestry of the class, and uses the ID properties to get the column
+# names, and assummes they must be the table primary keys.
+#
+# From there, it guesses the sequence name
+sub _resolve_sequence_name_from_class_id_properties {
+    my($self, $class_name) = @_;
+
+    my $class_meta = $class_name->__meta__;
+    for my $meta ($class_meta, $class_meta->ancestry_class_metas) {
+        next unless $meta->table_name;
+        my @primary_keys = grep { $_ }  # Only interested in the properties with columns defined
+                           map { $_->column_name }
+                           $meta->direct_id_property_metas;
+        if (@primary_keys > 1) {
+            Carp::croak("Tables with multiple primary keys (i.e. " .
+                $meta->table_name  . ": " .
+                join(',',@primary_keys) .
+                ") cannot have a surrogate key created from a sequence.");
+        }
+        elsif (@primary_keys == 1) {
+            my $sequence = $self->_get_sequence_name_for_table_and_column($meta->table_name, $primary_keys[0]);
+            return $sequence if $sequence;
+        }
+    }
+
+}
+
+
+sub _resolve_sequence_name_for_class_name {
+    my($self, $class_name) = @_;
+
+    my $table_name = $self->_resolve_table_name_for_class_name($class_name);
+
+    unless ($table_name) {
+        Carp::croak("Could not determine a table name for class $class_name");
+    }
+
+    my($ds_owner, $ds_table) = $self->_resolve_owner_and_table_from_table_name($table_name);
+    my $table_meta = UR::DataSource::RDBMS::Table->get(
+                         table_name => $ds_table,
+                         owner => $ds_owner,
+                         data_source => $self->_my_data_source_id);
+
+    my $sequence;
+    if ($table_meta) {
+        my @primary_keys = $table_meta->primary_key_constraint_column_names;
+        if (@primary_keys == 0) {
+            Carp::croak("No primary keys found for table " . $table_name . "\n");
+        }
+        $sequence = $self->_get_sequence_name_for_table_and_column($table_name, $primary_keys[0]);
+
+    } else {
+        # No metaDB info... try and make a guess based on the class' ID properties
+        $sequence = $self->_resolve_sequence_name_from_class_id_properties($class_name);
+    }
+    return $sequence;
+}
+
 our %sequence_for_class_name;
 sub autogenerate_new_object_id_for_class_name_and_rule {
     # The sequences in the database are named by a naming convention which allows us to connect them to the table
@@ -1353,72 +1435,34 @@ sub autogenerate_new_object_id_for_class_name_and_rule {
 
     my $sequence = $sequence_for_class_name{$class_name} || $class_name->__meta__->id_generator;
     
-    # FIXME Child classes really should use the same sequence generator as its parent
-    # if it doesn't specify its own.
-    # It'll be hard to distinguish the case of a class meta not explicitly mentioning its
-    # sequence name, but there's a sequence generator in the schema for it (the current
-    # mechanism), and when we should defer to the parent's sequence...
-    unless ($sequence) {
-        # This class directly doesn't have a sequence specified.  Search through the inheritance
-        my $table_name;
-        for my $parent_class_name ($class_name, $class_name->inheritance) {
-            # print "checking $parent_class_name (for $class_name)\n";
-            my $parent_class = $parent_class_name->__meta__; # UR::Object::Type->get(class_name => $parent_class_name);
-            # print "object $parent_class\n";
-            next unless $parent_class;
-            #$sequence = $class_meta->id_generator;
-            #last if $sequence;
-            if ($table_name = $parent_class->table_name) {
-                # print "found table $table_name\n";
-                last;
+    my $new_id = eval {
+        # FIXME Child classes really should use the same sequence generator as its parent
+        # if it doesn't specify its own.
+        # It'll be hard to distinguish the case of a class meta not explicitly mentioning its
+        # sequence name, but there's a sequence generator in the schema for it (the current
+        # mechanism), and when we should defer to the parent's sequence...
+        unless ($sequence) {
+            $sequence = $self->_resolve_sequence_name_for_class_name($class_name);
+
+            if (!$sequence) {
+                Carp::croak("No identity generator found for class " . $class_name . "\n");
             }
+
+            $sequence_for_class_name{$class_name} = $sequence;
         }
 
-        unless ($table_name) {
-            Carp::croak("Could not determine a table name for class $class_name");
-        }
+        $self->__signal_observers__('sequence_nextval', $sequence);
 
-        my($ds_owner, $ds_table) = $self->_resolve_owner_and_table_from_table_name($table_name);
-        my $table_meta = UR::DataSource::RDBMS::Table->get(
-                             table_name => $ds_table,
-                             owner => $ds_owner,
-                             data_source => $self->_my_data_source_id);
+        $self->_get_next_value_from_sequence($sequence);
+    };
 
-        my @primary_keys;
-        if ($table_meta) {
-            @primary_keys = $table_meta->primary_key_constraint_column_names;
-            $sequence = $self->_get_sequence_name_for_table_and_column($table_name, $primary_keys[0]);
-        } else {
-            # No metaDB info... try and make a guess based on the class' ID properties
-            my $class_meta = $class_name->__meta__;
-            for my $meta ($class_meta, $class_meta->ancestry_class_metas) {
-                @primary_keys = grep { $_ }  # Only interested in the properties with columns defined
-                                map { $_->column_name }
-                                $meta->direct_id_property_metas;
-                if (@primary_keys > 1) {
-                    Carp::croak("Tables with multiple primary keys (i.e. " .
-                        $table_name  . ": " .
-                        join(',',@primary_keys) .
-                        ") cannot have a surrogate key created from a sequence.");
-                } 
-                elsif (@primary_keys == 1) {
-                    $sequence = $self->_get_sequence_name_for_table_and_column($table_name, $primary_keys[0]);
-                    last if $sequence;
-                }
-            }
-        }
-
-        if (@primary_keys == 0) {
-            Carp::croak("No primary keys found for table " . $table_name . "\n");
-        }
-        if (!$sequence) {
-            Carp::croak("No identity generator found for table " . $table_name . "\n");
-        }
-
-        $sequence_for_class_name{$class_name} = $sequence;
+    unless (defined $new_id) {
+        my $dbh = $self->get_default_handle;
+        $self->__signal_observers__('sequence_nextval_failed', '', $sequence, $dbh->errstr);
+        no warnings 'uninitialized';
+        Carp::croak("Can't get next value for sequence $sequence. Exception: $@.  DBI error: ".$dbh->errstr);
     }
 
-    my $new_id = $self->_get_next_value_from_sequence($sequence);
     return $new_id;
 }
 
@@ -1446,6 +1490,20 @@ sub resolve_order_by_clause {
         }
     }
     return  'order by ' . join(', ',@cols);
+}
+
+
+sub do_sql {
+    my $self = shift;
+    my $sql = shift;
+
+    my $dbh = $self->get_default_handle;
+    my $rv = $dbh->do($sql);
+    unless ($rv) {
+        $self->__signal_observers__('do_failed', 'do', $sql, $dbh->errstr);
+        Carp::croak("DBI do() failed: ".$dbh->errstr);
+    }
+    return $rv;
 }
 
 
@@ -1534,12 +1592,14 @@ sub create_iterator_closure_for_rule {
     my $dbh = $self->get_default_handle;
     my $sth = $dbh->prepare($sql,$query_plan->{query_config});
     unless ($sth) {
-        $class_name->error_message("Failed to prepare SQL $sql\n" . $dbh->errstr . "\n");
-        Carp::confess($class_name->error_message);
+        $self->__signal_observers__('query_failed', 'prepare', $sql, $dbh->errstr);
+        $self->error_message("Failed to prepare SQL $sql\n" . $dbh->errstr . "\n");
+        Carp::confess($self->error_message);
     }
     unless ($sth->execute(@all_sql_params)) {
-        $class_name->error_message("Failed to execute SQL $sql\n" . $sth->errstr . "\n" . Data::Dumper::Dumper(\@all_sql_params) . "\n");
-        Carp::confess($class_name->error_message);
+        $self->__signal_observers__('query_failed', 'execute', $sql, $dbh->errstr);
+        $self->error_message("Failed to execute SQL $sql\n" . $sth->errstr . "\n" . Data::Dumper::Dumper(\@all_sql_params) . "\n");
+        Carp::confess($self->error_message);
     }
 
     die unless $sth;   # FIXME - this has no effect, right?  
@@ -2232,12 +2292,13 @@ sub _sync_database {
             my $class_name = $cmd->{class};
 
             # get the db handle to use for this class
-            my $dbh = $cmd->{'dbh'};   #$class_name->dbh;
+            my $dbh = $cmd->{dbh};
             my $sth = $dbh->prepare($sql);
             $sth{$sql} = $sth;
 
-            if ($dbh->errstr)
+            unless ($sth)
             {
+                $self->__signal_observers__('commit_failed', 'prepare', $sql, $dbh->errstr);
                 $self->error_message("Error preparing SQL:\n$sql\n" . $dbh->errstr . "\n");
                 return;
             }
@@ -2287,6 +2348,17 @@ sub _sync_database {
 
             $self->_alter_sth_for_selecting_blob_columns($sth,\@column_objects);
         }
+    }
+
+    # DBI docs say that if AutoCommit is on, then starting a transaction will temporarily
+    # turn it off.  When the handle gets commit() or rollback(), it will get turned back
+    # on automatically by DBI
+    if ($dbh->{AutoCommit}
+        and
+        ! eval { $dbh->begin_work; 1 }
+    ) {
+        Carp::croak(sprintf('Cannot begin transaction on data source %s: %s',
+                            $self->id, $dbh->errstr));
     }
 
     # Set a savepoint if possible.
@@ -2341,26 +2413,6 @@ sub _sync_database {
             }
             if ($failed_attempts > 1) {
                 my $err = join("\n",@err);
-                #$UR::Context::current->send_email(
-                #    To => 'example@example.edu',
-                #    From => UR::Context::Process->prog_name . ' <example@example.edu>',
-                #    Subject => (
-                #            $failed_attempts >= $max_failed_attempts
-                #            ? "sync_database lock failure after $failed_attempts attempts"
-                #            : "sync_database lock success after $failed_attempts attempts"
-                #        )
-                #        . " in " . UR::Context::Process->prog_name
-                #        . " on $table_name",
-                #    Message => qq/
-                #        $failed_attempts attempts to lock table $table_name
-                #
-                #        Errors:
-                #        $err
-                #
-                #        The complete table lock list for this sync:
-                #        @tables_requiring_lock
-                #    /
-                #);
                 if ($failed_attempts >= $max_failed_attempts) {
                     $self->error_message(
                         "Could not obtain an exclusive table lock on table "
@@ -2388,8 +2440,9 @@ sub _sync_database {
         for my $cmd (@explicit_commands_in_order) {
             unless ($sth{$cmd->{sql}}->execute(@{$cmd->{params}}))
             {
-                #my $dbh = $cmd->{class}->dbh;
+                my $dbh = $cmd->{dbh};
                 # my $dbh = UR::Context->resolve_data_source_for_object($cmd->{class})->get_default_handle;
+                $self->__signal_observers__('commit_failed', 'execute', $cmd->{sql}, $dbh->errstr);
                 push @failures, {cmd => $cmd, error_message => $sth{$cmd->{sql}}->errstr};
                 last if $skip_fault_tolerance_check;
             }
@@ -3001,11 +3054,27 @@ sub _do_on_default_dbh {
 
 sub commit {
     my $self = shift;
+    if ($self->has_default_handle) {
+        if (my $dbh = $self->get_default_handle) {
+            if ($dbh->{AutoCommit} ) {
+                $self->debug_message('Ignoring ineffective commit because AutoCommit is on');
+                return 1;
+            }
+        }
+    }
     $self->_do_on_default_dbh('commit', @_);
 }
 
 sub rollback {
     my $self = shift;
+    if ($self->has_default_handle) {
+        if (my $dbh = $self->get_default_handle) {
+            if ($dbh->{AutoCommit} ) {
+                $self->debug_message('Ignoring ineffective rollback because AutoCommit is on');
+                return 1;
+            }
+        }
+    }
     $self->_do_on_default_dbh('rollback', @_);
 }
 
@@ -3256,8 +3325,10 @@ sub ur_data_type_for_data_source_data_type {
 #
 # SQLite basically treats everything as strings, so needs no conversion.
 # other DBs will have their own conversions
+#
+# $sql_clause will be one of "join", "where"
 sub cast_for_data_conversion {
-    my($class, $prop_meta1, $prop_meta2) = @_;
+    my($class, $left_type, $right_type, $operator, $sql_clause) = @_;
 
     return ('%s', '%s');
 }

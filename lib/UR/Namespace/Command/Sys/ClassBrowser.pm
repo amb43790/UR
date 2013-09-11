@@ -566,6 +566,7 @@ sub property_metadata_list {
 
 package UR::Namespace::Command::Sys::ClassBrowser::TreeItem;
 
+use Data::UUID;
 our $ug = Data::UUID->new();
 sub new {
     my $class = shift;
