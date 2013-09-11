@@ -2382,10 +2382,6 @@ sub _sync_database {
         }
         $self->_last_savepoint($savepoint);
     }
-    else {
-        # FIXME SQLite dosen't support savepoints, but autocommit is already off so this dies?!
-        $dbh->begin_work;
-    }
 
     # Do any explicit table locking necessary.
     if (my @tables_requiring_lock = sort keys %tables_requiring_lock) {
