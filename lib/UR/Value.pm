@@ -4,6 +4,9 @@ use strict;
 use warnings;
 
 require UR;
+
+use List::MoreUtils;
+
 our $VERSION = "0.41"; # UR $VERSION;
 
 our @CARP_NOT = qw( UR::Context );
@@ -23,49 +26,124 @@ sub __load__ {
     my $class = shift;
     my $rule = shift;
     my $expected_headers = shift;
-$DB::single = 1;
-    my $id = $rule->value_for_id;
-    unless (defined $id) {
-        #$DB::single = 1;
-        Carp::croak "Can't load an infinite set of $class.  Some id properties were not specified in the rule $rule";
+
+    my $class_meta = $class->__meta__;
+    unless ($class_meta->{_value_loader}) {
+        my @id_property_names = $class_meta->all_id_property_names;
+        my %id_property_names = map { $_ => 1 } @id_property_names;
+
+        my $loader = sub {
+            my $bx = shift;
+            my $id = $bx->value_for_id;
+            unless (defined $id) {
+                Carp::croak "Can't load an infinite set of "
+                            . $bx->subject_class_name
+                            . ".  Some id properties were not specified in the rule $bx";
+            }
+            my @rows;
+            if (ref($id) and ref($id) eq 'ARRAY') {
+                # Multiple IDs passed in - return rows for multiple objects
+                my @non_id = grep { ! $id_property_names{$_} } $bx->template->_property_names;
+                if (@non_id) {
+                    Carp::croak("Cannot load class "
+                                . $bx->subject_class_name
+                                . " via UR::DataSource::Default when 'id' is a listref and non-id"
+                                . " properties appear in the rule: "
+                                . join(', ', @non_id));
+                }
+
+                # Get the 1st value from each list, then the second, then the third, etc
+                my $iter = List::MoreUtils::each_arrayref
+                            map {
+                                my $v = $bx->value_for($_);
+                                (ref($v) eq 'ARRAY')
+                                    ? $v
+                                    : [ $v ]
+                            }
+                            @$expected_headers;
+                while(my @row = $iter->()) {
+                    push @rows, \@row;
+                }
+
+            } else {
+                # single ID - return a single row
+                my @row = map { $bx->value_for($_) } @$expected_headers;
+                @rows = ( \@row );
+            }
+            return ($expected_headers, \@rows);
+        };
+
+        $class_meta->{_value_loader} = $loader;
     }
 
-    if (ref($id) and ref($id) eq 'ARRAY') {
-        # We're being asked to load up more than one object.  In the basic case, this is only
-        # possible if the rule _only_ contains ID properties.  For anything more complicated,
-        # the subclass should implement its own behavior
-
-        my $class_meta = $class->__meta__;
-
-        my %id_properties = map { $_ => $rule->value_for($_) } $class_meta->all_id_property_names;
-        my @non_id = grep { ! $id_properties{$_} } $rule->template->_property_names;
-        if (@non_id) {
-            Carp::croak("Cannot load class $class via UR::DataSource::Default when 'id' is a listref and non-id properties appear in the rule:" . join(', ', @non_id));
-        }
-        my $count = @$expected_headers;
-
-        my @rows;
-        for (my $row_n = 0; $row_n < @$id; $row_n++) {
-            my @row = map { $id_properties{$_}[$row_n] } @$expected_headers;
-            push @rows,\@row;
-        }
-
-        #my $listifier = sub { my $c = $count; my @l; push(@l,$_[0]) while ($c--); return \@l };
-        return ($expected_headers, \@rows);
-    }
-
-
-    my @values;
-    foreach my $header ( @$expected_headers ) {
-        my $value = $rule->value_for($header);
-        push @values, $value;
-    }
-
-    return $expected_headers, [\@values];
+    return $class_meta->{_value_loader}->($rule);
 }
 
 sub underlying_data_types {
     return ();
 }
+
+package UR::Value::Type;
+
+sub get_composite_id_decomposer {
+    my $class_meta = shift;
+
+    unless ($class_meta->{get_composite_id_decomposer}) {
+        my @id_property_names = $class_meta->id_property_names;
+        my $instance_class = $class_meta->class_name;
+        if (my $decomposer = $instance_class->can('__deserialize_id__')) {
+            $class_meta->{get_composite_id_decomposer} = sub {
+                my @ids = (ref($_[0]) and ref($_[0]) eq 'ARRAY')
+                            ? @{$_[0]}
+                            : ( $_[0] );
+                my @retval;
+                if (@ids == 1) {
+                    my $h = $instance_class->$decomposer($ids[0]);
+                    @retval = @$h{@id_property_names};
+
+                } else {
+                    # Get the 1st value from each list, then the second, then the third, etc
+                    my @decomposed = map {
+                            my $h = $instance_class->$decomposer($_);
+                            [ @$h{@id_property_names} ]
+                        }
+                        @ids;
+                    my $iter = List::MoreUtils::each_arrayref @decomposed;
+
+                    while( my @row = $iter->() ) {
+                        push @retval, \@row;
+                    }
+                }
+                return @retval;
+            };
+
+        } else {
+            $decomposer = $class_meta->SUPER::get_composite_id_decomposer();
+            $class_meta->{get_composite_id_decomposer} = $decomposer;
+        }
+    }
+    return $class_meta->{get_composite_id_decomposer};
+}
+
+sub get_composite_id_resolver {
+    my $class_meta = shift;
+    unless ($class_meta->{get_composite_id_resolver}) {
+        my @id_property_names = $class_meta->id_property_names;
+        my $instance_class = $class_meta->class_name;
+        if (my $resolver = $instance_class->can('__serialize_id__')) {
+            $class_meta->{get_composite_id_resolver} = sub {
+                my %h = map { $_ => shift } @id_property_names;
+                return $instance_class->__serialize_id__(\%h);
+            };
+
+        } else {
+            $resolver = $class_meta->SUPER::get_composite_id_resolver();
+            $class_meta->{get_composite_id_resolver} = $resolver;
+        }
+    }
+    return $class_meta->{get_composite_id_resolver};
+}
+
+
 
 1;

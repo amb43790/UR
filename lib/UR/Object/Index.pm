@@ -8,14 +8,37 @@ use strict;
 use warnings;
 require UR;
 
+use List::MoreUtils;
 
 # wrapper for one of the ID properties to make it less ugly
 
 sub indexed_property_names
 {
-    no warnings;
-    return split(/,/,$_[0]->{indexed_property_string});
+    my $self = shift;
+    unless (exists $self->{indexed_property_names}) {
+        no warnings;
+        $self->{indexed_property_names} = [ split(/,/,$self->{indexed_property_string}) ];
+    }
+    return @{$self->{indexed_property_names}};
 }
+
+sub indexed_property_numericness {
+    my $self = shift;
+    unless (exists $self->{indexed_property_numericness}) {
+        my $class_meta = $self->indexed_class_name->__meta__;
+        my @is_numeric = map {
+                            my @props = $class_meta->_concrete_property_meta_for_class_and_name($_);
+                            @props == 1
+                                ? $props[0]->is_numeric
+                                : 0     # multiple ID properties are treated as a string
+                        }
+                        $self->indexed_property_names;
+
+        $self->{indexed_property_numericness} = \@is_numeric;
+    }
+    return @{ $self->{indexed_property_numericness} };
+}
+
 
 # the only non-id property has an accessor...
 
@@ -58,13 +81,18 @@ sub create {
 
 sub get_objects_matching
 {
+    my $self = shift;
+    my @values = @_;
+
     # The hash access below generates warnings
     # where undef is a value.  Ignore these.
     no warnings 'uninitialized';
-    
-    my @hr = (shift->{data_tree});
-    my $value;
-    for $value (@_)
+
+    my @hr = ($self->{data_tree});
+    my @is_numeric = $self->indexed_property_numericness;
+
+    my $iter = List::MoreUtils::each_array(@values, @is_numeric);
+    while(my($value, $is_numeric) = $iter->())
     {               
         my $value_ref = ref($value);
         if($value_ref eq "HASH")
@@ -102,7 +130,7 @@ sub get_objects_matching
                         # Get the values using the regular or negative match op.
                         foreach my $h (@hr) {
                             foreach my $k (sort keys %$h) {
-                                next unless $k ne '';  # an earlier undef value got saved as an empty string here
+                                next if $k eq '';  # an earlier undef value got saved as an empty string here
                                 if($k !~ /$regex/) {
                                     push @thr, $h->{$k};
                                 }
@@ -114,7 +142,7 @@ sub get_objects_matching
                         # Standard positive match
                         for my $h (@hr) {
                             for my $k (sort keys %$h) {
-                                next unless $k ne '';  # an earlier undef value got saved as an empty string here
+                                next if $k eq '';  # an earlier undef value got saved as an empty string here
                                 if ($k =~ /$regex/) {
                                     push @thr, $h->{$k};
                                 }
@@ -190,8 +218,12 @@ sub get_objects_matching
                             # An empty string for $k means the object's value was loaded as NULL
                             # and we want things like 0 != NULL to be true to match the SQL that
                             # gets generated for the same rule
-                            no warnings 'numeric';
-                            if($k eq '' or $k != $value->{value} or $k ne $value->{value}) {
+                            my $t = ($k eq '')
+                                    ||
+                                    ($is_numeric
+                                        ? $k != $value->{value}
+                                        : $k ne $value->{value});
+                            if ($t) {
                                 push @thr, $h->{$k};
                             }
                         }
@@ -201,8 +233,11 @@ sub get_objects_matching
                     my @thr;
                     foreach my $h (@hr) {
                         foreach my $k (keys %$h) {
-                            next unless $k ne '';  # an earlier undef value got saved as an empty string here
-                            if($k > $value->{value} xor $not) {
+                            next if $k eq '';  # an earlier undef value got saved as an empty string here
+                            my $t = $is_numeric
+                                        ? $k > $value->{value}
+                                        : $k gt $value->{value};
+                            if ($t xor $not) {
                                 push @thr, $h->{$k};
                             }
                         }
@@ -212,8 +247,11 @@ sub get_objects_matching
                     my @thr;
                     foreach my $h (@hr) {
                         foreach my $k (keys %$h) {
-                            next unless $k ne '';  # an earlier undef value got saved as an empty string here
-                            if($k < $value->{value} xor $not) {
+                            next if $k eq '';  # an earlier undef value got saved as an empty string here
+                            my $t = $is_numeric
+                                        ? $k < $value->{value}
+                                        : $k lt $value->{value};
+                            if ($t xor $not) {
                                 push @thr, $h->{$k};
                             }
                         }
@@ -223,8 +261,11 @@ sub get_objects_matching
                     my @thr;
                     foreach my $h (@hr) {
                         foreach my $k (keys %$h) {
-                            next unless $k ne '';  # an earlier undef value got saved as an empty string here
-                            if($k >= $value->{value} xor $not) {
+                            next if $k eq '';  # an earlier undef value got saved as an empty string here
+                            my $t = $is_numeric
+                                        ? $k >= $value->{value}
+                                        : $k ge $value->{value};
+                            if ($t xor $not) {
                                 push @thr, $h->{$k};
                             }
                         }
@@ -234,8 +275,11 @@ sub get_objects_matching
                     my @thr;
                     foreach my $h (@hr) {
                         foreach my $k (keys %$h) {
-                            next unless $k ne '';  # an earlier undef value got saved as an empty string here
-                            if($k <= $value->{value} xor $not) {
+                            next if $k eq '';  # an earlier undef value got saved as an empty string here
+                            my $t = $is_numeric
+                                        ? $k <= $value->{value}
+                                        : $k le $value->{value};
+                            if ($t xor $not) {
                                 push @thr, $h->{$k};
                             }
                         }
@@ -245,7 +289,7 @@ sub get_objects_matching
                     my @thr;
                     foreach my $h (@hr) {
                         foreach my $k (sort keys %$h) {
-                            next unless $k ne '';  # an earlier undef value got saved as an empty string here
+                            next if $k eq '';  # an earlier undef value got saved as an empty string here
                             if($k ne $value->{value} xor $not) {
                                 push @thr, $h->{$k};
                             }
@@ -267,7 +311,11 @@ sub get_objects_matching
                     my ($min,$max) = @{ $value->{value} };
                     foreach my $h (@hr) {
                         foreach my $k (sort keys %$h) {
-                            if((length($k) and $k >= $min and $k <= $max) xor $not) {
+                            next if $k eq '';
+                            my $t = $is_numeric
+                                        ? ( $k >= $min and $k <= $max )
+                                        : ( $k ge $min and $k le $max );
+                            if ($t xor $not) {
                                 push @thr, $h->{$k};
                             }
                         }
@@ -322,14 +370,14 @@ sub _build_data_tree
     }
     
     # _add_object in bulk.
-    my ($object,@values,$hr,$value);
     for my $object ($UR::Context::current->all_objects_loaded($indexed_class_name)) {
+        my(@values, $hr);
         if (@indexed_property_names) {
             @values = map { my $val = $object->$_; defined $val ? $val : undef } @indexed_property_names;
             @values = (undef) unless(@values);
         }
         $hr = $hr_base;
-        for $value (@values)
+        for my $value (@values)
         {
             no warnings 'uninitialized';  # in case $value is undef
             $hr->{$value} ||= {};
@@ -488,6 +536,25 @@ sub _add_object($$)
     if ($UR::Context::light_cache and substr($self->indexed_class_name,0,5) ne 'App::') {
         Scalar::Util::weaken($hr->{$object->id});
     }
+}
+
+sub _all_objects_indexed {
+    my $self = shift;
+
+    my @object_hashes = ( $self->{data_tree} );
+
+    # Recurse one level deep for each indexed property name
+    # and collect the hashes at that level
+    foreach ( $self->indexed_property_names ) {
+        my @new_object_hashes;
+        while (my $hr = shift @object_hashes) {
+            push @new_object_hashes, values(%$hr);
+        }
+        @object_hashes = @new_object_hashes;
+    }
+
+    # The final level's values are all the objects
+    return map { values %$_ } @object_hashes;
 }
 
 1;

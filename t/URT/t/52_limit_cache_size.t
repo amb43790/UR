@@ -115,7 +115,9 @@ sub setup_classes_and_db {
 
     UR::Object::Type->define(
         class_name => 'URT::Thing',
-        id_by => 'thing_id',
+        id_by => [
+            thing_id => { is => 'Integer' },
+        ],
         has => [
             name => { is => 'String' },
             datas => { is => 'URT::Data', reverse_as => 'thing', is_many => 1 },
@@ -149,11 +151,11 @@ sub count_things_in_cache {
     }
 
     foreach my $c ( @classes ) {
-        my $this = scalar(values %{$UR::Context::all_objects_loaded->{$c}});
+#        my $this = scalar(values %{$UR::Context::all_objects_loaded->{$c}});
 #        print "Found $this $c objects\n";
-        foreach (values %{$UR::Context::all_objects_loaded->{$c}} ) {
+#        foreach (values %{$UR::Context::all_objects_loaded->{$c}} ) {
 #            print "\tid ",$_->id,"\n";
-        }
+#        }
         $count += scalar(values %{$UR::Context::all_objects_loaded->{$c}});
     }
     return $count;
