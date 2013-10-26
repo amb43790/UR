@@ -8,7 +8,7 @@ use warnings;
 require UR;
 our $VERSION = "0.41"; # UR $VERSION;
 
-use Scalar::Util qw(blessed);
+use Scalar::Util qw(blessed reftype refaddr);
 use Data::Dumper;
 use FreezeThaw;
 
@@ -34,7 +34,69 @@ sub values_to_value_id_frozen {
 sub value_id_to_values_frozen {
     my $self = shift;
     my $value_id = shift;
-    return FreezeThaw::thaw($value_id);
+    return $self->_fixup_ur_objects_from_thawed_data(FreezeThaw::thaw($value_id));
+}
+
+sub _fixup_ur_objects_from_thawed_data {
+    my $self = shift;
+    my @values = @_;
+
+    our $seen;
+    local $seen = $seen;
+    $seen ||= {};
+
+    # For things that are UR::Objects (or used to be UR objects), swap the
+    # thawed/cloned one with one from the object cache
+    #
+    # This sub is localized inside _fixup_ur_objects_from_thawed_data so it's not called
+    # externally, and uses $_ as the thing to process, which is set in the foreach loop
+    # below - both as a performance speedup of# not having to prepare an argument list while
+    # processing a possibly deep data structure, and clarity of avoiding double dereferencing
+    # as this sub needs to mutate the item it's processing
+    my $process_it = sub {
+        if (blessed($_)
+            and (
+                $_->isa('UR::Object')
+                or
+                $_->isa('UR::BoolExpr::Util::clonedThing')
+            )
+        ) {
+            my($class, $id) = ($_->class, $_->id);
+            if (refaddr($_) != refaddr($UR::Context::all_objects_loaded->{$class}->{$id})) {
+                # bless the original thing to a non-UR::Object class so UR::Object::DESTROY
+                # doesn't run on it
+                my $cloned_thing = UR::BoolExpr::Util::clonedThing->bless($_);
+                # Swap in the object from the object cache
+                $_ = $UR::Context::all_objects_loaded->{$class}->{$id};
+            }
+
+        }
+        $self->_fixup_ur_objects_from_thawed_data($_);
+    };
+
+    foreach my $data ( @values ) {
+        next unless ref $data; # Don't need to recursively inspect normal scalar data
+        next if $seen->{$data}++;
+
+        if (ref $data) {
+            my $reftype = reftype($data);
+            my $iter;
+            if ($reftype eq 'ARRAY') {
+                foreach (@$data) {
+                    &$process_it;
+                }
+            } elsif ($reftype eq 'HASH') {
+                foreach (values %$data) {
+                    &$process_it;
+                }
+
+            } elsif ($reftype eq 'SCALAR' or $reftype eq 'REF') {
+                local $_ = $$data;
+                &$process_it;
+            }
+        }
+    }
+    return @values;
 }
 
 # These are used for the simple common-case rules.
@@ -128,6 +190,24 @@ sub value_id_to_values {
 }
 
 *values_to_value_id_simple = \&values_to_value_id;
+
+package UR::BoolExpr::Util::clonedThing;
+
+sub bless {
+    my($class, $thing) = @_;
+#    return $thing if ($thing->isa(__PACKAGE__));
+
+    $thing->{__original_class} = $thing->class;
+    bless $thing, $class;
+}
+
+sub id {
+    return shift->{id};
+}
+
+sub class {
+    return shift->{__original_class};
+}
 
 1;
 
