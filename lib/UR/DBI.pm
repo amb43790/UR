@@ -166,11 +166,6 @@ sub connect
     
     my $rv = $self->SUPER::connect(@_);
     UR::DBI::after_execute();
-    if ($rv) {
-        $UR::DBI::known_dbhs{$rv} = $rv;
-        Scalar::Util::weaken($UR::DBI::known_dbhs{$rv});
-        $UR::DBI::connect_str{$rv} = $params_stringified;
-    }
     return $rv;
 }
 
@@ -814,10 +809,6 @@ sub selectrow_array
 
 sub DESTROY
 {
-    if ($_[0]->{Active}) {
-        $_[0]->rollback;
-        $_[0]->disconnect;
-    }
     UR::DBI::before_execute("destroying connection");
     shift->SUPER::DESTROY(@_);
     UR::DBI::after_execute("destroying connection");
