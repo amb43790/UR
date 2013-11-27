@@ -2271,7 +2271,7 @@ sub _sync_database {
         my $max_failed_attempts = 10;
         for my $table_name (@tables_requiring_lock) {
             my($ds_owner, $ds_table) = $self->_resolve_owner_and_table_from_table_name($table_name);
-			my $table = $self->_get_table_object($ds_table, $ds_owner);
+			      my $table = $self->_get_table_object($ds_table, $ds_owner);
             my $dbh = $table->dbh;
             my $sth = $dbh->prepare("lock table $table_name in exclusive mode");
             my $failed_attempts = 0;
