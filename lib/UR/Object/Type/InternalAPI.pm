@@ -706,15 +706,10 @@ sub is_uncachable {
 # Mechanisms for generating object IDs when none were specified at
 # creation time
 
-my $uuid_generator;
 sub autogenerate_new_object_id_uuid {
-    my $uuid_generator ||= do {
-      require OSSP::uuid;
-      OSSP::uuid->new;
-    };
-    $uuid_generator->make("v1"); 
-    my $uuid = $uuid_generator->export("str"); 
-    $uuid =~ s/-//g; 
+    require Data::UUID;
+    my $uuid = Data::UUID->new->create_hex();
+    $uuid =~ s/^0x//;
     return $uuid;
 }
 
